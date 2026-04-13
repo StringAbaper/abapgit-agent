@@ -2,6 +2,7 @@
 *"*"Local Interface:
 **********************************************************************
 " DUMP command implementation - query short dumps from ST22
+" ECC 7.40 compatible: reads SNAP table + FLIST parsing (no SNAP_ADT dependency)
 CLASS zcl_abgagt_command_dump DEFINITION
   PUBLIC FINAL
   CREATE PUBLIC.
@@ -69,7 +70,7 @@ CLASS zcl_abgagt_command_dump DEFINITION
       END OF ty_dump_result.
 
   PRIVATE SECTION.
-    " Build a composite ID from SNAP_ADT key fields using : as separator
+    " Build a composite ID from SNAP key fields using : as separator
     METHODS build_id
       IMPORTING
         iv_datum TYPE sydatum
@@ -88,37 +89,34 @@ CLASS zcl_abgagt_command_dump DEFINITION
       RETURNING
         VALUE(rs_key) TYPE snap_key.
 
+    " Metadata extracted from the SNAP FLIST stream
     TYPES:
-      BEGIN OF ty_snap_row,
-        datum         TYPE snap_adt-datum,
-        uzeit         TYPE snap_adt-uzeit,
-        ahost         TYPE snap_adt-ahost,
-        uname         TYPE snap_adt-uname,
-        mandt         TYPE snap_adt-mandt,
-        modno         TYPE snap_adt-modno,
-        timestamp     TYPE snap_adt-timestamp,
-        runtime_error TYPE snap_adt-runtime_error,
-        mainprog      TYPE snap_adt-mainprog,
-        object_name   TYPE snap_adt-object_name,
-        exc           TYPE snap_adt-exc,
-        devclass      TYPE snap_adt-devclass,
-      END OF ty_snap_row.
+      BEGIN OF ty_flist_info,
+        errid     TYPE s380errid,  " FC - runtime error name
+        mainprog  TYPE syrepid,    " AM - main program
+        program   TYPE syrepid,    " AP - application program (current)
+        include   TYPE syrepid,    " AI - application include
+        lineno    TYPE string,     " AL - application line number
+        exception TYPE string,     " XC - exception class name
+      END OF ty_flist_info.
 
-    TYPES ty_snap_rows TYPE STANDARD TABLE OF ty_snap_row WITH DEFAULT KEY.
+    " Parse SNAP FLIST stream to extract dump metadata.
+    " Same technique as FM RS_ST22_GET_DUMPS: reads SEQNO='000' FLIST fields.
+    " Format: stream of [2-char attr code][3-digit length][data] terminated by '%'.
+    METHODS parse_flist
+      IMPORTING
+        is_snap        TYPE snap
+      RETURNING
+        VALUE(rs_info) TYPE ty_flist_info.
 
-    TYPES:
-      BEGIN OF ty_snap_detail,
-        datum         TYPE snap_adt-datum,
-        uzeit         TYPE snap_adt-uzeit,
-        uname         TYPE snap_adt-uname,
-        mainprog      TYPE snap_adt-mainprog,
-        object_name   TYPE snap_adt-object_name,
-        runtime_error TYPE snap_adt-runtime_error,
-        exc           TYPE snap_adt-exc,
-        devclass      TYPE snap_adt-devclass,
-        ahost         TYPE snap_adt-ahost,
-        timestamp     TYPE snap_adt-timestamp,
-      END OF ty_snap_detail.
+    " Convert server-local datum/uzeit to UTC timestamp string (YYYYMMDDhhmmss)
+    METHODS get_utc_timestamp
+      IMPORTING
+        iv_datum            TYPE sydatum
+        iv_uzeit            TYPE syuzeit
+        iv_sys_tz           TYPE timezone
+      RETURNING
+        VALUE(rv_timestamp) TYPE string.
 ENDCLASS.
 
 CLASS zcl_abgagt_command_dump IMPLEMENTATION.
@@ -131,6 +129,7 @@ CLASS zcl_abgagt_command_dump IMPLEMENTATION.
     DATA: ls_params              TYPE ty_dump_params,
           ls_result              TYPE ty_dump_result,
           lv_limit               TYPE i,
+          lv_sys_tz              TYPE timezone,
           ls_key                 TYPE snap_key,
           lt_keys                TYPE snap_keys,
           lt_entries             TYPE snap_entries,
@@ -142,6 +141,7 @@ CLASS zcl_abgagt_command_dump IMPLEMENTATION.
           lt_source              TYPE sourcetable,
           lv_error_lineno        TYPE i,
           lv_error_include       TYPE syrepid,
+          lv_mainprog            TYPE syrepid,
           lv_source_with_marker  TYPE string,
           lv_src_line            TYPE string,
           lv_idx                 TYPE i,
@@ -149,16 +149,18 @@ CLASS zcl_abgagt_command_dump IMPLEMENTATION.
           lv_stack_heading       TYPE string,
           lv_stack_text          TYPE string,
           ls_text_entry          TYPE ty_stack_entry,
-          ls_adt                 TYPE ty_snap_detail,
-          lt_adt                 TYPE ty_snap_rows,
+          lt_snap                TYPE STANDARD TABLE OF snap WITH DEFAULT KEY,
+          ls_snap                TYPE snap,
+          ls_flist               TYPE ty_flist_info,
+          lv_prog                TYPE syrepid,
           lv_filter_user         TYPE syuname,
-          lv_filter_program      TYPE syrepid,
-          lv_filter_error        TYPE s380errid,
           lv_ts_from             TYPE timestamp,
           lv_ts_to               TYPE timestamp,
           lv_date_from           TYPE sydatum,
           lv_date_to             TYPE sydatum,
-          ls_adt2                TYPE ty_snap_row,
+          lv_time_tmp            TYPE syuzeit,
+          lv_entry_ts            TYPE timestamp,
+          lv_count               TYPE i,
           ls_row                 TYPE ty_dump_item,
           lx_error               TYPE REF TO cx_root.
 
@@ -174,7 +176,11 @@ CLASS zcl_abgagt_command_dump IMPLEMENTATION.
     ENDIF.
     lv_limit = ls_params-limit.
 
-    " Detail mode: load full dump text for a specific dump ID
+    " Cache system timezone for UTC conversions
+    CALL FUNCTION 'GET_SYSTEM_TIMEZONE'
+      IMPORTING timezone = lv_sys_tz.
+
+    " ── Detail mode: load full dump text for a specific dump ID ────
     IF ls_params-detail IS NOT INITIAL.
       ls_key = parse_id( ls_params-detail ).
 
@@ -218,9 +224,10 @@ CLASS zcl_abgagt_command_dump IMPLEMENTATION.
           " Get source code at error location with >>>>> marker on error line
           lo_dump->get_abap_sourceinfo(
             IMPORTING
-              p_e_include    = lv_error_include
-              p_e_lineno     = lv_error_lineno
-              p_e_sourcetext = lt_source ).
+              p_e_include     = lv_error_include
+              p_e_mainprogram = lv_mainprog
+              p_e_lineno      = lv_error_lineno
+              p_e_sourcetext  = lt_source ).
 
           IF lt_source IS NOT INITIAL AND lv_error_lineno > 0.
             ls_item-source_line    = lv_error_lineno.
@@ -259,30 +266,20 @@ CLASS zcl_abgagt_command_dump IMPLEMENTATION.
             ENDIF.
           ENDIF.
 
-          " Get metadata from SNAP_ADT to populate the remaining fields
-          SELECT SINGLE datum, uzeit, uname, mainprog, object_name,
-                         runtime_error, exc, devclass, ahost, timestamp
-            FROM snap_adt
-            WHERE mandt  = @sy-mandt
-              AND datum  = @ls_key-datum
-              AND uzeit  = @ls_key-uzeit
-              AND ahost  = @ls_key-ahost
-              AND uname  = @ls_key-uname
-              AND modno  = @ls_key-modno
-            INTO @ls_adt.
-
-          IF sy-subrc = 0.
-            ls_item-date          = |{ ls_adt-datum+0(4) }-{ ls_adt-datum+4(2) }-{ ls_adt-datum+6(2) }|.
-            ls_item-time          = |{ ls_adt-uzeit+0(2) }:{ ls_adt-uzeit+2(2) }:{ ls_adt-uzeit+4(2) }|.
-            ls_item-utc_timestamp = |{ ls_adt-timestamp }|.
-            ls_item-user          = ls_adt-uname.
-            ls_item-program       = ls_adt-mainprog.
-            ls_item-object        = ls_adt-object_name.
-            ls_item-error         = ls_adt-runtime_error.
-            ls_item-exception     = ls_adt-exc.
-            ls_item-package       = ls_adt-devclass.
-            ls_item-host          = ls_adt-ahost.
-          ENDIF.
+          " Populate metadata from CL_RUNTIME_ERROR instance + snap_key
+          " (no SNAP_ADT dependency — works on 7.40)
+          ls_item-date          = |{ ls_key-datum+0(4) }-{ ls_key-datum+4(2) }-{ ls_key-datum+6(2) }|.
+          ls_item-time          = |{ ls_key-uzeit+0(2) }:{ ls_key-uzeit+2(2) }:{ ls_key-uzeit+4(2) }|.
+          ls_item-utc_timestamp = get_utc_timestamp(
+                                    iv_datum  = ls_key-datum
+                                    iv_uzeit  = ls_key-uzeit
+                                    iv_sys_tz = lv_sys_tz ).
+          ls_item-user          = ls_key-uname.
+          ls_item-host          = ls_key-ahost.
+          ls_item-program       = lv_mainprog.
+          ls_item-error         = lo_dump->get_errid( ).
+          lo_dump->get_exception(
+            IMPORTING p_exception = ls_item-exception ).
 
           APPEND ls_item TO ls_result-dumps.
           ls_result-success = abap_true.
@@ -301,111 +298,37 @@ CLASS zcl_abgagt_command_dump IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    " List mode: query SNAP_ADT summary table
+    " ── List mode: read from SNAP table (always populated on 7.40+) ──
+    " Reads SEQNO='000' header records and parses FLIST stream for metadata,
+    " same technique as FM RS_ST22_GET_DUMPS.
+    " User filter goes in SQL WHERE; error/program are in FLIST so filtered in ABAP.
 
-    " Copy filter fields to scalar variables for SQL WHERE (7.40: struct fields
-    " cannot be used with IS INITIAL in WHERE; scalars work correctly)
-    lv_filter_user    = ls_params-user.
-    lv_filter_program = ls_params-program.
-    lv_filter_error   = ls_params-error.
+    lv_filter_user = ls_params-user.
 
     IF ls_params-ts_from IS NOT INITIAL.
-      " Timezone-aware mode: filter by UTC TIMESTAMP field
+      " UTC timestamp mode: convert to server-local date range, post-filter for precision
       lv_ts_from = ls_params-ts_from.
       lv_ts_to   = ls_params-ts_to.
 
-      IF lv_filter_user IS NOT INITIAL
-          AND lv_filter_program IS NOT INITIAL
-          AND lv_filter_error IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt         = @sy-mandt
-            AND timestamp     BETWEEN @lv_ts_from AND @lv_ts_to
-            AND uname         = @lv_filter_user
-            AND mainprog      = @lv_filter_program
-            AND runtime_error = @lv_filter_error
-          ORDER BY timestamp DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
-      ELSEIF lv_filter_user IS NOT INITIAL
-          AND lv_filter_program IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt     = @sy-mandt
-            AND timestamp BETWEEN @lv_ts_from AND @lv_ts_to
-            AND uname     = @lv_filter_user
-            AND mainprog  = @lv_filter_program
-          ORDER BY timestamp DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
-      ELSEIF lv_filter_user IS NOT INITIAL
-          AND lv_filter_error IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt         = @sy-mandt
-            AND timestamp     BETWEEN @lv_ts_from AND @lv_ts_to
-            AND uname         = @lv_filter_user
-            AND runtime_error = @lv_filter_error
-          ORDER BY timestamp DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
-      ELSEIF lv_filter_program IS NOT INITIAL
-          AND lv_filter_error IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt         = @sy-mandt
-            AND timestamp     BETWEEN @lv_ts_from AND @lv_ts_to
-            AND mainprog      = @lv_filter_program
-            AND runtime_error = @lv_filter_error
-          ORDER BY timestamp DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
-      ELSEIF lv_filter_user IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt     = @sy-mandt
-            AND timestamp BETWEEN @lv_ts_from AND @lv_ts_to
-            AND uname     = @lv_filter_user
-          ORDER BY timestamp DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
-      ELSEIF lv_filter_program IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt     = @sy-mandt
-            AND timestamp BETWEEN @lv_ts_from AND @lv_ts_to
-            AND mainprog  = @lv_filter_program
-          ORDER BY timestamp DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
-      ELSEIF lv_filter_error IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt         = @sy-mandt
-            AND timestamp     BETWEEN @lv_ts_from AND @lv_ts_to
-            AND runtime_error = @lv_filter_error
-          ORDER BY timestamp DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
+      CONVERT TIME STAMP lv_ts_from TIME ZONE lv_sys_tz
+        INTO DATE lv_date_from TIME lv_time_tmp.
+      CONVERT TIME STAMP lv_ts_to TIME ZONE lv_sys_tz
+        INTO DATE lv_date_to TIME lv_time_tmp.
+
+      IF lv_filter_user IS NOT INITIAL.
+        SELECT * FROM snap INTO TABLE @lt_snap
+          WHERE mandt = @sy-mandt
+            AND datum BETWEEN @lv_date_from AND @lv_date_to
+            AND seqno = '000'
+            AND uname = @lv_filter_user.
       ELSE.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt     = @sy-mandt
-            AND timestamp BETWEEN @lv_ts_from AND @lv_ts_to
-          ORDER BY timestamp DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
+        SELECT * FROM snap INTO TABLE @lt_snap
+          WHERE mandt = @sy-mandt
+            AND datum BETWEEN @lv_date_from AND @lv_date_to
+            AND seqno = '000'.
       ENDIF.
     ELSE.
-      " Server-local-time mode: filter by DATUM / UZEIT
+      " Server-local time mode (default: last 7 days)
       lv_date_from = ls_params-date_from.
       lv_date_to   = ls_params-date_to.
       IF lv_date_from IS INITIAL.
@@ -415,126 +338,87 @@ CLASS zcl_abgagt_command_dump IMPLEMENTATION.
         lv_date_to = sy-datum.
       ENDIF.
 
-      " Build WHERE dynamically based on which filters are active
-      IF lv_filter_user IS NOT INITIAL
-          AND lv_filter_program IS NOT INITIAL
-          AND lv_filter_error IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt         = @sy-mandt
-            AND datum         BETWEEN @lv_date_from AND @lv_date_to
-            AND uname         = @lv_filter_user
-            AND mainprog      = @lv_filter_program
-            AND runtime_error = @lv_filter_error
-          ORDER BY datum DESCENDING, uzeit DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
-      ELSEIF lv_filter_user IS NOT INITIAL
-          AND lv_filter_program IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt    = @sy-mandt
-            AND datum    BETWEEN @lv_date_from AND @lv_date_to
-            AND uname    = @lv_filter_user
-            AND mainprog = @lv_filter_program
-          ORDER BY datum DESCENDING, uzeit DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
-      ELSEIF lv_filter_user IS NOT INITIAL
-          AND lv_filter_error IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt         = @sy-mandt
-            AND datum         BETWEEN @lv_date_from AND @lv_date_to
-            AND uname         = @lv_filter_user
-            AND runtime_error = @lv_filter_error
-          ORDER BY datum DESCENDING, uzeit DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
-      ELSEIF lv_filter_program IS NOT INITIAL
-          AND lv_filter_error IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt         = @sy-mandt
-            AND datum         BETWEEN @lv_date_from AND @lv_date_to
-            AND mainprog      = @lv_filter_program
-            AND runtime_error = @lv_filter_error
-          ORDER BY datum DESCENDING, uzeit DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
-      ELSEIF lv_filter_user IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
+      IF lv_filter_user IS NOT INITIAL.
+        SELECT * FROM snap INTO TABLE @lt_snap
           WHERE mandt = @sy-mandt
             AND datum BETWEEN @lv_date_from AND @lv_date_to
-            AND uname = @lv_filter_user
-          ORDER BY datum DESCENDING, uzeit DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
-      ELSEIF lv_filter_program IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt    = @sy-mandt
-            AND datum    BETWEEN @lv_date_from AND @lv_date_to
-            AND mainprog = @lv_filter_program
-          ORDER BY datum DESCENDING, uzeit DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
-      ELSEIF lv_filter_error IS NOT INITIAL.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
-          WHERE mandt         = @sy-mandt
-            AND datum         BETWEEN @lv_date_from AND @lv_date_to
-            AND runtime_error = @lv_filter_error
-          ORDER BY datum DESCENDING, uzeit DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
+            AND seqno = '000'
+            AND uname = @lv_filter_user.
       ELSE.
-        SELECT datum, uzeit, ahost, uname, mandt, modno, timestamp,
-               runtime_error, mainprog, object_name, exc, devclass
-          FROM snap_adt
+        SELECT * FROM snap INTO TABLE @lt_snap
           WHERE mandt = @sy-mandt
             AND datum BETWEEN @lv_date_from AND @lv_date_to
-          ORDER BY datum DESCENDING, uzeit DESCENDING
-          INTO TABLE @lt_adt
-          UP TO @lv_limit ROWS.
-      ENDIF.
-
-      " Apply time-of-day filter (no SQL equivalent for partial range)
-      IF ls_params-time_from IS NOT INITIAL.
-        DELETE lt_adt WHERE uzeit < ls_params-time_from.
-      ENDIF.
-      IF ls_params-time_to IS NOT INITIAL.
-        DELETE lt_adt WHERE uzeit > ls_params-time_to.
+            AND seqno = '000'.
       ENDIF.
     ENDIF.
 
-    LOOP AT lt_adt INTO ls_adt2.
+    " Sort newest first
+    SORT lt_snap BY datum DESCENDING uzeit DESCENDING.
+
+    " Parse FLIST, apply filters, build result
+    LOOP AT lt_snap INTO ls_snap.
+      ls_flist = parse_flist( ls_snap ).
+
+      " Apply time-of-day filter (server-local mode only)
+      IF ls_params-ts_from IS INITIAL.
+        IF ls_params-time_from IS NOT INITIAL AND ls_snap-uzeit < ls_params-time_from.
+          CONTINUE.
+        ENDIF.
+        IF ls_params-time_to IS NOT INITIAL AND ls_snap-uzeit > ls_params-time_to.
+          CONTINUE.
+        ENDIF.
+      ENDIF.
+
+      " Apply error filter (errid is in FLIST, not a SQL column)
+      IF ls_params-error IS NOT INITIAL AND ls_flist-errid <> ls_params-error.
+        CONTINUE.
+      ENDIF.
+
+      " Determine program name: prefer mainprog (AM), fall back to program (AP)
+      IF ls_flist-mainprog IS NOT INITIAL.
+        lv_prog = ls_flist-mainprog.
+      ELSE.
+        lv_prog = ls_flist-program.
+      ENDIF.
+
+      " Apply program filter
+      IF ls_params-program IS NOT INITIAL AND lv_prog <> ls_params-program.
+        CONTINUE.
+      ENDIF.
+
+      " UTC timestamp post-filter for precision in timestamp mode
+      IF ls_params-ts_from IS NOT INITIAL.
+        CONVERT DATE ls_snap-datum TIME ls_snap-uzeit
+          INTO TIME STAMP lv_entry_ts TIME ZONE lv_sys_tz.
+        IF lv_entry_ts < lv_ts_from OR lv_entry_ts > lv_ts_to.
+          CONTINUE.
+        ENDIF.
+      ENDIF.
+
+      lv_count = lv_count + 1.
+      IF lv_count > lv_limit.
+        EXIT.
+      ENDIF.
+
       CLEAR ls_row.
       ls_row-id        = build_id(
-                           iv_datum = ls_adt2-datum
-                           iv_uzeit = ls_adt2-uzeit
-                           iv_ahost = ls_adt2-ahost
-                           iv_uname = ls_adt2-uname
-                           iv_mandt = ls_adt2-mandt
-                           iv_modno = ls_adt2-modno ).
-      ls_row-utc_timestamp = |{ ls_adt2-timestamp }|.
-      ls_row-date      = |{ ls_adt2-datum+0(4) }-{ ls_adt2-datum+4(2) }-{ ls_adt2-datum+6(2) }|.
-      ls_row-time      = |{ ls_adt2-uzeit+0(2) }:{ ls_adt2-uzeit+2(2) }:{ ls_adt2-uzeit+4(2) }|.
-      ls_row-user      = ls_adt2-uname.
-      ls_row-program   = ls_adt2-mainprog.
-      ls_row-object    = ls_adt2-object_name.
-      ls_row-error     = ls_adt2-runtime_error.
-      ls_row-exception = ls_adt2-exc.
-      ls_row-package   = ls_adt2-devclass.
-      ls_row-host      = ls_adt2-ahost.
+                           iv_datum = ls_snap-datum
+                           iv_uzeit = ls_snap-uzeit
+                           iv_ahost = ls_snap-ahost
+                           iv_uname = ls_snap-uname
+                           iv_mandt = ls_snap-mandt
+                           iv_modno = ls_snap-modno ).
+      ls_row-utc_timestamp = get_utc_timestamp(
+                               iv_datum  = ls_snap-datum
+                               iv_uzeit  = ls_snap-uzeit
+                               iv_sys_tz = lv_sys_tz ).
+      ls_row-date      = |{ ls_snap-datum+0(4) }-{ ls_snap-datum+4(2) }-{ ls_snap-datum+6(2) }|.
+      ls_row-time      = |{ ls_snap-uzeit+0(2) }:{ ls_snap-uzeit+2(2) }:{ ls_snap-uzeit+4(2) }|.
+      ls_row-user      = ls_snap-uname.
+      ls_row-program   = lv_prog.
+      ls_row-error     = ls_flist-errid.
+      ls_row-exception = ls_flist-exception.
+      ls_row-host      = ls_snap-ahost.
       APPEND ls_row TO ls_result-dumps.
     ENDLOOP.
 
@@ -562,6 +446,80 @@ CLASS zcl_abgagt_command_dump IMPLEMENTATION.
         rs_key-modno  = lt_parts[ 6 ].
     CATCH cx_sy_itab_line_not_found ##NO_HANDLER.
     ENDTRY.
+  ENDMETHOD.
+
+  METHOD parse_flist.
+    " Parse SNAP FLIST stream — same technique as FM RS_ST22_GET_DUMPS.
+    " SNAP stores dump attributes in FLIST..FLIST08 (8 x CHAR 200 = 1600 bytes).
+    " Format: stream of [2-char attr code][3-digit length][data] terminated by '%'.
+    DATA: lv_x   TYPE i,
+          lv_y   TYPE i,
+          lv_cnt TYPE i.
+    FIELD-SYMBOLS <buffer> TYPE c.
+
+    ASSIGN is_snap-flist(1600) TO <buffer> RANGE is_snap.
+
+    CATCH SYSTEM-EXCEPTIONS conversion_errors = 0 data_access_errors = 0.
+
+      WHILE <buffer>+lv_x(1) <> '%' AND lv_cnt < 6.
+        CASE <buffer>+lv_x(2).
+          WHEN 'FC'.                    " runtime error name (e.g. MESSAGE_TYPE_X)
+            ADD 1 TO lv_cnt.
+            ADD 2 TO lv_x.
+            lv_y = <buffer>+lv_x(3).
+            ADD 3 TO lv_x.
+            rs_info-errid = <buffer>+lv_x(lv_y).
+            ADD lv_y TO lv_x.
+          WHEN 'AM'.                    " main program
+            ADD 1 TO lv_cnt.
+            ADD 2 TO lv_x.
+            lv_y = <buffer>+lv_x(3).
+            ADD 3 TO lv_x.
+            rs_info-mainprog = <buffer>+lv_x(lv_y).
+            ADD lv_y TO lv_x.
+          WHEN 'AP'.                    " application program (current at crash)
+            ADD 1 TO lv_cnt.
+            ADD 2 TO lv_x.
+            lv_y = <buffer>+lv_x(3).
+            ADD 3 TO lv_x.
+            rs_info-program = <buffer>+lv_x(lv_y).
+            ADD lv_y TO lv_x.
+          WHEN 'AI'.                    " application include
+            ADD 1 TO lv_cnt.
+            ADD 2 TO lv_x.
+            lv_y = <buffer>+lv_x(3).
+            ADD 3 TO lv_x.
+            rs_info-include = <buffer>+lv_x(lv_y).
+            ADD lv_y TO lv_x.
+          WHEN 'AL'.                    " application line number
+            ADD 1 TO lv_cnt.
+            ADD 2 TO lv_x.
+            lv_y = <buffer>+lv_x(3).
+            ADD 3 TO lv_x.
+            rs_info-lineno = <buffer>+lv_x(lv_y).
+            ADD lv_y TO lv_x.
+          WHEN 'XC'.                    " exception class name
+            ADD 1 TO lv_cnt.
+            ADD 2 TO lv_x.
+            lv_y = <buffer>+lv_x(3).
+            ADD 3 TO lv_x.
+            rs_info-exception = <buffer>+lv_x(lv_y).
+            ADD lv_y TO lv_x.
+          WHEN OTHERS.
+            " Skip unknown attributes
+            ADD 2 TO lv_x.
+            lv_x = lv_x + 3 + <buffer>+lv_x(3).
+        ENDCASE.
+      ENDWHILE.
+
+    ENDCATCH.
+  ENDMETHOD.
+
+  METHOD get_utc_timestamp.
+    DATA lv_ts TYPE timestamp.
+    CONVERT DATE iv_datum TIME iv_uzeit
+      INTO TIME STAMP lv_ts TIME ZONE iv_sys_tz.
+    rv_timestamp = |{ lv_ts }|.
   ENDMETHOD.
 
 ENDCLASS.
