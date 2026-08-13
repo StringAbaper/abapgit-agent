@@ -16,3 +16,4 @@ _site/
 .sass-cache/
 Gemfile.lock
 .release-notes-draft.md
+.adt.creds
